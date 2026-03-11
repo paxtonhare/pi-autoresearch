@@ -1,6 +1,8 @@
-# 🔬 pi-autoresearch
+# pi-autoresearch — autonomous experiment loop for pi
 
-> Autonomous experiment loop for [pi](https://github.com/badlogic/pi) — run, measure, keep or discard, repeat forever.
+**[Install](#install)** · **[Usage](#usage)** · **[How it works](#how-it-works)**
+
+*Try an idea, measure it, keep what works, discard what doesn't, repeat forever.*
 
 Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). Works for any optimization target: test speed, bundle size, LLM training, build times, Lighthouse scores.
 
@@ -130,4 +132,4 @@ A fresh agent with no memory can read these two files and continue exactly where
 
 ## License
 
-MIT © [Tobi Lutke](https://github.com/tobi), [David Cortés](https://github.com/davebcn87)
+MIT
