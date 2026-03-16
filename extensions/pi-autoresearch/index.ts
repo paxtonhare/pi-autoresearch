@@ -648,7 +648,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             for (const name of Object.keys(entry.metrics ?? {})) {
               if (!state.secondaryMetrics.find((m) => m.name === name)) {
                 let unit = "";
-                if (name.endsWith("_µs") || name.endsWith("µs")) unit = "µs";
+                if (name.endsWith("µs")) unit = "µs";
                 else if (name.endsWith("_ms")) unit = "ms";
                 else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
                 else if (name.endsWith("_kb")) unit = "kb";
@@ -1328,7 +1328,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       for (const name of Object.keys(secondaryMetrics)) {
         if (!state.secondaryMetrics.find((m) => m.name === name)) {
           let unit = "";
-          if (name.endsWith("_µs") || name.endsWith("µs")) unit = "µs";
+          if (name.endsWith("µs")) unit = "µs";
           else if (name.endsWith("_ms")) unit = "ms";
           else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
           else if (name.endsWith("_kb")) unit = "kb";
