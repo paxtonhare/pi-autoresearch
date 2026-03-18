@@ -837,7 +837,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               if (entry.metricUnit !== undefined) state.metricUnit = entry.metricUnit;
               if (entry.bestDirection) state.bestDirection = entry.bestDirection;
               // Increment segment (first config = 0, second = 1, etc.)
-              if (state.results.length > 0) segment++;
+              if (state.results.length > 0) {
+                segment++;
+                // Reset per-segment tracking (mirrors live reinit behavior)
+                state.secondaryMetrics = [];
+              }
               state.currentSegment = segment;
               continue;
             }
