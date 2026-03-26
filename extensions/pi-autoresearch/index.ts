@@ -2349,9 +2349,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (runtime.runningExperiment) tui.requestRender();
           }, 80);
 
+          const computeViewportRows = () => {
+            const termH = process.stdout.rows || 40;
+            const overlayMaxH = Math.floor(termH * 0.9);
+            return Math.max(4, overlayMaxH - 4);
+          };
+
           return {
             render(width: number): string[] {
-              const termH = process.stdout.rows || 40;
               const border = (s: string) => theme.fg("accent", s);
 
               // Inner content width: │ + space + content + space + │
@@ -2373,9 +2378,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               }
 
               const totalRows = content.length;
-              // Fit within overlay maxHeight (90% of terminal) minus 4 for borders + bottom spacing
-              const overlayMaxH = Math.floor(termH * 0.9);
-              const viewportRows = Math.max(4, overlayMaxH - 4);
+              const viewportRows = computeViewportRows();
 
               // Clamp scroll
               const maxScroll = Math.max(0, totalRows - viewportRows);
@@ -2392,7 +2395,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               // Budget: ┌── (3) + space (1) + title + space (1) + fill + ┐ (1) = width
               const maxTitleVisW = width - 6;
               if (titleVisW > maxTitleVisW) {
-                title = title.slice(0, Math.max(5, maxTitleVisW - 1)) + "…";
+                title = truncateToWidth(title, Math.max(5, maxTitleVisW));
               }
               const titleActualVisW = visibleWidth(title);
               const topFillLen = Math.max(0, width - 6 - titleActualVisW);
@@ -2448,9 +2451,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             },
 
             handleInput(data: string): void {
-              const termH = process.stdout.rows || 40;
-              const overlayMaxH = Math.floor(termH * 0.9);
-              const viewportRows = Math.max(4, overlayMaxH - 4);
+              const viewportRows = computeViewportRows();
               const actualContent = renderDashboardLines(state, process.stdout.columns || 120, theme, 0);
               const totalRows = actualContent.length + (runtime.runningExperiment ? 1 : 0);
               const maxScroll = Math.max(0, totalRows - viewportRows);
