@@ -2927,6 +2927,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "off") {
+        const wasRunning = !ctx.isIdle();
+
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
         runtime.lastAutoResumeTime = 0;
@@ -2939,7 +2941,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         cancelPendingResume(runtime);
         stopDashboardServer();
         clearSessionUi(ctx);
-        ctx.ui.notify("Autoresearch mode OFF", "info");
+        if (wasRunning) ctx.abort();
+        ctx.ui.notify(
+          wasRunning ? "Autoresearch mode OFF — aborting current run" : "Autoresearch mode OFF",
+          "info"
+        );
         return;
       }
 
