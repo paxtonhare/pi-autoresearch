@@ -1043,27 +1043,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const hasRunExperimentsThisSession = (runtime: AutoresearchRuntime): boolean =>
     runtime.experimentsThisSession > 0;
 
-  // After agent_end, only resume if the turn produced a real experiment —
-  // otherwise we'd kick the loop off after every plain chat reply.
-  // (We deliberately don't gate on the 5-minute cooldown here: the
-  // experiment-this-turn check already guards against chat-only loops, and
-  // MAX_AUTORESUME_TURNS caps the long-running case.)
-  const shouldAutoResumeAfterTurn = (runtime: AutoresearchRuntime): boolean => {
-    if (!runtime.autoresearchMode) return false;
-    if (!hasRunExperimentsThisSession(runtime)) return false;
-    return true;
-  };
+  // Why the experiment gate: a chat-only turn would otherwise loop forever,
+  // because every agent_end would re-prompt the agent, which would chat again.
+  const shouldAutoResumeAfterTurn = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoresearchMode && hasRunExperimentsThisSession(runtime);
 
-  // After compaction, resume whenever autoresearch is on. Compaction is itself
-  // evidence the loop was running and got interrupted (mid-setup, mid-turn, or
-  // mid-experiment) — don't gate on whether log_experiment happened to fire
-  // in the partial turn that just got summarised away, and don't gate on the
-  // 5-minute cooldown either (rapid /compact bursts or split-turn auto-compact
-  // at low context windows would otherwise leave the loop dead).
-  const shouldAutoResumeAfterCompact = (runtime: AutoresearchRuntime): boolean => {
-    if (!runtime.autoresearchMode) return false;
-    return true;
-  };
+  const shouldAutoResumeAfterCompact = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoresearchMode;
 
   const hasReachedAutoResumeLimit = (runtime: AutoresearchRuntime): boolean =>
     runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS;
@@ -1079,9 +1065,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     fs.existsSync(autoresearchIdeasPath(resolveWorkDir(ctx.cwd)));
 
   const composeResumeMessage = (ctx: ExtensionContext): string => {
-    // After compaction, the post-summary turn has lost most prior tool output.
-    // Re-anchor the agent against the persisted files — they are the source of truth
-    // for objective, baseline, recent results, and deferred ideas.
     const parts = [
       "Autoresearch loop ended (likely context limit and auto-compaction).",
       "Re-read the persisted autoresearch context before continuing: autoresearch.md (rules), the tail of autoresearch.jsonl (recent kept/discarded runs and ASI), and git log (commits map 1:1 to kept experiments).",
@@ -1435,11 +1418,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pausePendingResume(runtime);
   });
 
-  // Schedule a resume after a quiescent moment (agent turn ended, or compaction
-  // completed). If a resume message is already pending from a prior turn, just
-  // reschedule its timer; otherwise compose a fresh one. The gate predicate is
-  // caller-specific: turn-end is strict (require an experiment this turn),
-  // compaction is permissive (autoresearch on is enough).
   const ensurePendingResume = (
     ctx: ExtensionContext,
     gate: (runtime: AutoresearchRuntime) => boolean,
@@ -1701,12 +1679,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // Context window management: pi auto-compacts when contextTokens > contextWindow - reserveTokens
-      // (see node_modules/@mariozechner/pi-coding-agent/docs/compaction.md). When that fires,
-      // session_before_compact / session_compact pause and reschedule the pendingResume timer
-      // installed by agent_end, so the loop continues automatically after the summary lands.
-      // TODO(/tree): once pi exposes programmatic /tree navigation, replace compaction-based resume
-      // with a checkpoint-per-iteration model — see davebcn87/pi-autoresearch#41 discussion.
+      // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
