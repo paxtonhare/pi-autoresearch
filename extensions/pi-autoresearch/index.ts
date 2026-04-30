@@ -973,6 +973,25 @@ function renderDashboardLines(
 }
 
 // ---------------------------------------------------------------------------
+// Command argument completions
+// ---------------------------------------------------------------------------
+
+const AUTORESEARCH_ARGUMENT_COMPLETIONS = [
+  "help",
+  "off",
+  "clear",
+  "export",
+  "--help",
+  "-h",
+];
+
+export function getAutoresearchArgumentCompletions(prefix: string) {
+  return AUTORESEARCH_ARGUMENT_COMPLETIONS
+    .filter((option) => option.startsWith(prefix))
+    .map((value) => ({ value, label: value }));
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -1164,21 +1183,38 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
-  const autoresearchHelp = () =>
-    [
-      "Usage: /autoresearch [off|clear|export|<text>]",
-      "",
-      "<text> enters autoresearch mode and starts or resumes the loop.",
-      "off leaves autoresearch mode.",
-      "clear deletes autoresearch.jsonl and turns autoresearch mode off.",
-      "export opens a local live dashboard for autoresearch.jsonl in your browser.",
+  const autoresearchHelp = () => {
+    const width = 86;
+    const innerWidth = width - 4;
+    const top = `╭${"─".repeat(width - 2)}╮`;
+    const divider = `├${"─".repeat(width - 2)}┤`;
+    const bottom = `╰${"─".repeat(width - 2)}╯`;
+    const line = (text = "") => {
+      const clipped = truncateToWidth(text, innerWidth);
+      return `│ ${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))} │`;
+    };
 
-      "",
-      "Examples:",
-      "  /autoresearch optimize unit test runtime, monitor correctness",
-      "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
-      "  /autoresearch export",
+    return [
+      top,
+      line("🔬  AUTORESEARCH COMMAND HELP"),
+      line("    Autonomous optimization loops for pi"),
+      divider,
+      line("Usage"),
+      line("  /autoresearch [off|clear|export|<text>]"),
+      line(),
+      line("Commands"),
+      line("  <text>   Start or resume autoresearch mode with your optimization goal."),
+      line("  off      Leave autoresearch mode."),
+      line("  clear    Delete autoresearch.jsonl and turn autoresearch mode off."),
+      line("  export   Open a live dashboard for autoresearch.jsonl in your browser."),
+      line(),
+      line("Examples"),
+      line("  /autoresearch optimize unit test runtime, monitor correctness"),
+      line("  /autoresearch model training, run 5 minutes of train.py"),
+      line("  /autoresearch export"),
+      bottom,
     ].join("\n");
+  };
 
   // -----------------------------------------------------------------------
   // State reconstruction
@@ -2917,12 +2953,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("autoresearch", {
     description: "Start, stop, clear, or resume autoresearch mode",
+    getArgumentCompletions: getAutoresearchArgumentCompletions,
     handler: async (args, ctx) => {
       const runtime = getRuntime(ctx);
       const trimmedArgs = (args ?? "").trim();
       const command = trimmedArgs.toLowerCase();
 
-      if (!trimmedArgs) {
+      if (!trimmedArgs || command === "help" || command === "--help" || command === "-h") {
         ctx.ui.notify(autoresearchHelp(), "info");
         return;
       }
