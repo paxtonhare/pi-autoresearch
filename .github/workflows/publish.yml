@@ -84,8 +84,8 @@ jobs:
       - name: Publish to npm (via npm 11+ for OIDC trusted publisher)
         if: steps.check.outputs.publish == 'true'
         run: |
-          npx -y -p npm@latest -- npm --version
-          npx -y -p npm@latest -- npm publish --access public --provenance
+          npx -y -p npm@11 -- npm --version
+          npx -y -p npm@11 -- npm publish --access public --provenance
 
       - name: Extract release notes from CHANGELOG
         if: steps.release.outputs.create == 'true'

@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [1.6.2] - 2026-07-09
+
+### Changed
+
+- Raised the autoresearch auto-resume ceiling from 20 to 200 turns, while adding a stuck-loop override that stops auto-resume after more than 20 consecutive `discard` or `crash` results in the current segment.
+
+## [1.6.1] - 2026-07-02
+
+### Fixed
+
+- Redirected `workingDir` logs no longer auto-activate autoresearch in unrelated pi sessions.
+- `/autoresearch off` now persists across `/tree`, compaction, and reloads: a manual off is recorded as a session activation decision and is no longer overridden just because `log.jsonl` still exists.
+
+## [1.6.0] - 2026-06-08
+
+### Changed
+
+- Autoresearch now stores session files under the `.auto/` subfolder by default, with legacy file fallback for existing sessions.
+- The dashboard widget is now always expanded — the full results table renders inline above the editor at all times. Removed the collapsed one-liner mode and the `Ctrl+Shift+T` expand/collapse toggle (and its `shortcuts.toggleDashboard` config key). Fullscreen (`Ctrl+Shift+F`) remains the only dashboard toggle.
+- Migrated Pi package imports and dependencies from the `@mariozechner` npm scope to `@earendil-works`.
+
+## [1.5.0] - 2026-06-04
+
+### Changed
+
+- The `init_experiment`, `run_experiment`, and `log_experiment` tools are now revealed to the agent only while autoresearch mode is active, instead of being callable in every session. Outside autoresearch mode the tools are absent from the LLM's schema and system prompt, so the agent can no longer self-start a research loop — entry is via `/autoresearch` or resuming a session with an existing `autoresearch.jsonl`.
+
+## [1.4.0] - 2026-05-06
+
+### Added
+
+- Configurable dashboard keyboard shortcuts. Users can now override or disable the toggle and fullscreen shortcuts with a profile-aware `<agent-dir>/extensions/pi-autoresearch.json` config file, helping autoresearch coexist with other pi extensions that bind the same keys.
+- Shortcut resolution tests covering defaults, overrides, disabled shortcuts, partial configs, malformed configs, and extension registration.
+
+### Changed
+
+- Dashboard hints and README documentation now reflect the effective shortcuts from config.
+
 ## [1.3.0] - 2026-04-29
 
 ### Added

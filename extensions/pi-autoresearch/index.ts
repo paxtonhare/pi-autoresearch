@@ -8,20 +8,21 @@
  * - `run_experiment` tool — runs any command, times it, captures output, detects pass/fail
  * - `log_experiment` tool — records results with session-persisted state
  * - Status widget showing experiment count + best metric
- * - Ctrl+Shift+T toggle to expand/collapse full dashboard inline above the editor
- * - Adds autoresearch guidance to the system prompt and points the agent at autoresearch.md
- * - Injects autoresearch.md into context on every turn via before_agent_start
+ * - Configurable shortcut to open the fullscreen dashboard overlay
+ * - Adds autoresearch guidance to the system prompt and points the agent at .auto/prompt.md
+ * - Injects .auto/prompt.md into context on every turn via before_agent_start
  */
 
 import type {
+  CustomEntry,
   ExtensionAPI,
   ExtensionContext,
   SessionBeforeCompactEvent,
   Theme,
-} from "@mariozechner/pi-coding-agent";
-import { truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { Text, truncateToWidth, matchesKey, visibleWidth } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Text, truncateToWidth, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -50,6 +51,8 @@ import {
   autoresearchSummaryPathsFor,
   buildAutoresearchCompactionSummary,
 } from "./compaction.ts";
+import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
+import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -108,6 +111,41 @@ interface ExperimentState {
   confidence: number | null;
 }
 
+export const AUTORESUME_TURN_LIMIT = 200;
+export const CONSECUTIVE_FAILURE_OVERRIDE_LIMIT = 20;
+
+type AutoResumeGuardState = Pick<ExperimentState, "results" | "currentSegment">;
+type AutoResumeGuardRuntime = {
+  autoResumeTurns: number;
+  state: AutoResumeGuardState;
+};
+
+/** Count trailing discard/crash results in the current segment. */
+export function countConsecutiveDiscardOrCrashResults(state: AutoResumeGuardState): number {
+  let count = 0;
+  for (let i = state.results.length - 1; i >= 0; i--) {
+    const result = state.results[i];
+    if (result.segment !== state.currentSegment) break;
+    if (result.status === "discard" || result.status === "crash") {
+      count++;
+      continue;
+    }
+    break;
+  }
+  return count;
+}
+
+export function autoResumeStopReasonFor(runtime: AutoResumeGuardRuntime): string | null {
+  if (runtime.autoResumeTurns >= AUTORESUME_TURN_LIMIT) {
+    return `Autoresearch auto-resume limit reached (${AUTORESUME_TURN_LIMIT} turns)`;
+  }
+  const failures = countConsecutiveDiscardOrCrashResults(runtime.state);
+  if (failures > CONSECUTIVE_FAILURE_OVERRIDE_LIMIT) {
+    return `Autoresearch auto-resume stopped — ${failures} consecutive discards/crashes`;
+  }
+  return null;
+}
+
 interface RunDetails {
   command: string;
   exitCode: number | null;
@@ -139,7 +177,6 @@ interface LogDetails {
 
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
-  dashboardExpanded: boolean;
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
@@ -169,7 +206,7 @@ const RunParams = Type.Object({
   checks_timeout_seconds: Type.Optional(
     Type.Number({
       description:
-        "Kill autoresearch.checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
+        "Kill .auto/checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
     })
   ),
 });
@@ -330,12 +367,12 @@ function killTree(pid: number): void {
 }
 
 /**
- * Check if a command's primary purpose is running autoresearch.sh.
+ * Check if a command's primary purpose is running the benchmark script.
  *
  * Strategy: strip common harmless prefixes (env vars, env/time/nice wrappers)
- * then check that the core command is autoresearch.sh invoked via a known
- * pattern. Rejects chaining tricks like "evil.py; autoresearch.sh" because
- * we require autoresearch.sh to be the *first* real command.
+ * then check that the core command is the benchmark script invoked via a known
+ * pattern. Rejects chaining tricks like "evil.py; measure.sh" because we require
+ * the benchmark script to be the *first* real command.
  */
 function isAutoresearchShCommand(command: string): boolean {
   let cmd = command.trim();
@@ -351,14 +388,11 @@ function isAutoresearchShCommand(command: string): boolean {
     cmd = cmd.replace(/^(?:env|time|nice|nohup)(?:\s+-\S+(?:\s+\d+)?)*\s+/, "");
   } while (cmd !== prev);
 
-  // Now the core command must be autoresearch.sh via a known invocation:
-  //   autoresearch.sh
-  //   ./autoresearch.sh
-  //   /path/to/autoresearch.sh
-  //   bash [-flags] autoresearch.sh
-  //   bash [-flags] ./autoresearch.sh
-  //   bash [-flags] /path/to/autoresearch.sh
-  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\.\/|\/[\w/.-]*\/)?autoresearch\.sh(?:\s|$)/.test(cmd);
+  // Now the core command must be the benchmark script via a known invocation.
+  // Current layout requires the `.auto/measure.sh` path; legacy `autoresearch.sh`
+  // is still accepted for in-flight sessions. An optional path prefix allows
+  //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
+  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh)(?:\s|$)/.test(cmd);
 }
 
 function isBetter(
@@ -432,7 +466,7 @@ interface AutoresearchConfig {
   workingDir?: string;
 }
 
-/** Read autoresearch.config.json from the given directory (always ctx.cwd) */
+/** Read the config file (.auto/config.json, legacy autoresearch.config.json) from the given directory (always ctx.cwd) */
 function readConfig(cwd: string): AutoresearchConfig {
   try {
     const configPath = autoresearchConfigPath(cwd);
@@ -443,7 +477,7 @@ function readConfig(cwd: string): AutoresearchConfig {
   }
 }
 
-/** Read maxExperiments from autoresearch.config.json (if it exists) */
+/** Read maxExperiments from the config file (if it exists) */
 function readMaxExperiments(cwd: string): number | null {
   const config = readConfig(cwd);
   return (typeof config.maxIterations === "number" && config.maxIterations > 0)
@@ -453,7 +487,7 @@ function readMaxExperiments(cwd: string): number | null {
 
 /**
  * Resolve the effective working directory.
- * Reads workingDir from autoresearch.config.json in ctxCwd.
+ * Reads workingDir from the config file (.auto/config.json) in ctxCwd.
  * Returns ctxCwd if not set. Supports relative (resolved against ctxCwd) and absolute paths.
  */
 function resolveWorkDir(ctxCwd: string): string {
@@ -462,6 +496,66 @@ function resolveWorkDir(ctxCwd: string): string {
   return path.isAbsolute(config.workingDir)
     ? config.workingDir
     : path.resolve(ctxCwd, config.workingDir);
+}
+
+function canonicalPath(existingPath: string): string {
+  try {
+    return fs.realpathSync.native(existingPath);
+  } catch {
+    return path.resolve(existingPath);
+  }
+}
+
+function samePath(a: string, b: string): boolean {
+  return canonicalPath(a) === canonicalPath(b);
+}
+
+const AUTORESEARCH_ACTIVATION_ENTRY = "pi-autoresearch.activation";
+
+interface AutoresearchActivationEntryData {
+  version?: number;
+  workDir?: string;
+  active?: boolean;
+}
+
+export function shouldAutoActivateAutoresearch(
+  ctxCwd: string,
+  workDir: string,
+  hasPersistedLog: boolean,
+  recordedDecision: boolean | null = null,
+): boolean {
+  if (!hasPersistedLog) return false;
+  // An explicit `/autoresearch on|off` in this session always wins, so a manual
+  // off survives /tree, compaction, and reloads instead of snapping back on.
+  if (recordedDecision !== null) return recordedDecision;
+  // With no recorded decision, same-cwd sessions default on (a log implies intent);
+  // redirected workingDir sessions default off until this session opts in.
+  return samePath(ctxCwd, workDir);
+}
+
+function autoresearchActivationData(entry: CustomEntry): AutoresearchActivationEntryData | null {
+  if (entry.customType !== AUTORESEARCH_ACTIVATION_ENTRY) return null;
+
+  const data = entry.data as AutoresearchActivationEntryData | undefined;
+  if (typeof data?.workDir !== "string") return null;
+
+  return data;
+}
+
+function recordedActivationDecision(ctx: ExtensionContext, workDir: string): boolean | null {
+  const canonicalWorkDir = canonicalPath(workDir);
+  let decision: boolean | null = null;
+
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (entry.type !== "custom") continue;
+
+    const data = autoresearchActivationData(entry);
+    if (!data || canonicalPath(data.workDir) !== canonicalWorkDir) continue;
+
+    decision = data.active === true;
+  }
+
+  return decision;
 }
 
 /**
@@ -474,10 +568,10 @@ function validateWorkDir(ctxCwd: string): string | null {
   try {
     const stat = fs.statSync(workDir);
     if (!stat.isDirectory()) {
-      return `workingDir "${workDir}" (from autoresearch.config.json) is not a directory.`;
+      return `workingDir "${workDir}" (from .auto/config.json) is not a directory.`;
     }
   } catch {
-    return `workingDir "${workDir}" (from autoresearch.config.json) does not exist.`;
+    return `workingDir "${workDir}" (from .auto/config.json) does not exist.`;
   }
   return null;
 }
@@ -505,12 +599,12 @@ function findBestMetric(
 // Session file paths (single source of truth for autoresearch.* filenames)
 // -----------------------------------------------------------------------
 
-const autoresearchJsonlPath  = (dir: string) => path.join(dir, "autoresearch.jsonl");
-const autoresearchMdPath     = (dir: string) => path.join(dir, "autoresearch.md");
-const autoresearchIdeasPath  = (dir: string) => path.join(dir, "autoresearch.ideas.md");
-const autoresearchChecksPath = (dir: string) => path.join(dir, "autoresearch.checks.sh");
-const autoresearchScriptPath = (dir: string) => path.join(dir, "autoresearch.sh");
-const autoresearchConfigPath = (dir: string) => path.join(dir, "autoresearch.config.json");
+const autoresearchJsonlPath  = (dir: string) => sessionFilePath(dir, "log");
+const autoresearchMdPath     = (dir: string) => sessionFilePath(dir, "prompt");
+const autoresearchIdeasPath  = (dir: string) => sessionFilePath(dir, "ideas");
+const autoresearchChecksPath = (dir: string) => sessionFilePath(dir, "checks");
+const autoresearchScriptPath = (dir: string) => sessionFilePath(dir, "measure");
+const autoresearchConfigPath = (dir: string) => sessionFilePath(dir, "config");
 
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);
@@ -632,7 +726,6 @@ function createExperimentState(): ExperimentState {
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
-    dashboardExpanded: false,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
@@ -676,7 +769,7 @@ function renderDashboardLines(
   width: number,
   th: Theme,
   maxRows: number = 6,
-  headerHint?: string
+  headerHints: string[] = []
 ): string[] {
   const lines: string[] = [];
 
@@ -860,12 +953,8 @@ function renderDashboardLines(
     `${th.fg("muted", "description")}`;
 
   lines.push(
-    headerHint
-      ? appendRightAlignedAdaptiveHint(headerLine, width, th, [
-          headerHint,
-          "ctrl+shift+t collapse • full: ctrl+shift+f",
-          "ctrl+shift+t • ctrl+shift+f",
-        ])
+    headerHints.length > 0
+      ? appendRightAlignedAdaptiveHint(headerLine, width, th, headerHints)
       : truncateToWidth(headerLine, width, "…", true)
   );
   lines.push(
@@ -996,18 +1085,51 @@ export function getAutoresearchArgumentCompletions(prefix: string) {
 // ---------------------------------------------------------------------------
 
 export default function autoresearchExtension(pi: ExtensionAPI) {
-  const MAX_AUTORESUME_TURNS = 20;
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
   // Outlasts pi's internal retry (setTimeout 0) and compaction-continue
   // (setTimeout 100); see badlogic/pi-mono#2023, #2110.
   const SETTLED_WINDOW_MS = 800;
+  const shortcuts = resolveAutoresearchShortcuts();
+
+  const dashboardHintVariants = (): string[] => {
+    if (!shortcuts.fullscreenDashboard) return [];
+    return [
+      `${shortcuts.fullscreenDashboard} fullscreen`,
+      shortcuts.fullscreenDashboard,
+    ];
+  };
 
   const runtimeStore = createRuntimeStore();
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
+
+  // Registering through this gates the tool, so a new one can't slip in ungated.
+  const gatedToolNames = new Set<string>();
+  const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
+    gatedToolNames.add(tool.name);
+    pi.registerTool(tool);
+  };
+
+  // The one place mode flips: gated tools follow the flag, never drifting from it.
+  const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
+    getRuntime(ctx).autoresearchMode = enabled;
+    const activeTools = new Set(pi.getActiveTools()); // setActiveTools replaces the whole set
+    for (const tool of gatedToolNames) {
+      enabled ? activeTools.add(tool) : activeTools.delete(tool);
+    }
+    pi.setActiveTools([...activeTools]);
+  };
+
+  const recordAutoresearchActivation = (workDir: string, active: boolean): void => {
+    pi.appendEntry(AUTORESEARCH_ACTIVATION_ENTRY, {
+      version: 1,
+      workDir: canonicalPath(workDir),
+      active,
+    });
+  };
 
   const isAgentSettled = (ctx: ExtensionContext): boolean =>
     ctx.isIdle() && !ctx.hasPendingMessages();
@@ -1039,9 +1161,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
     if (!isAgentSettled(ctx)) return;
-    if (hasReachedAutoResumeLimit(runtime)) {
+    const stopReason = autoResumeStopReasonFor(runtime);
+    if (stopReason !== null) {
       cancelPendingResume(runtime);
-      notifyAutoResumeLimitReached(ctx);
+      notifyAutoResumeLimitReached(ctx, stopReason);
       return;
     }
 
@@ -1075,14 +1198,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const shouldAutoResumeAfterCompact = (runtime: AutoresearchRuntime): boolean =>
     runtime.autoresearchMode;
 
-  const hasReachedAutoResumeLimit = (runtime: AutoresearchRuntime): boolean =>
-    runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS;
-
-  const notifyAutoResumeLimitReached = (ctx: ExtensionContext): void => {
-    ctx.ui.notify(
-      `Autoresearch auto-resume limit reached (${MAX_AUTORESUME_TURNS} turns)`,
-      "info",
-    );
+  const notifyAutoResumeLimitReached = (ctx: ExtensionContext, reason?: string | null): void => {
+    ctx.ui.notify(reason ?? `Autoresearch auto-resume limit reached`, "info");
   };
 
   const composeResumeMessage = (_ctx: ExtensionContext): string => {
@@ -1099,7 +1216,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return [
       "Run the next iteration now.",
       "Pick the most promising hypothesis from the ideas backlog or the latest `next:` hints in recent runs, then call run_experiment + log_experiment.",
-      "Do not re-read autoresearch.md or autoresearch.jsonl — the compaction summary already contains them.",
+      "Do not re-read .auto/prompt.md or .auto/log.jsonl — the compaction summary already contains them.",
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -1205,8 +1322,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       line("Commands"),
       line("  <text>   Start or resume autoresearch mode with your optimization goal."),
       line("  off      Leave autoresearch mode."),
-      line("  clear    Delete autoresearch.jsonl and turn autoresearch mode off."),
-      line("  export   Open a live dashboard for autoresearch.jsonl in your browser."),
+      line("  clear    Delete the session log (.auto/log.jsonl) and turn autoresearch mode off."),
+      line("  export   Open a live dashboard for the session log in your browser."),
       line(),
       line("Examples"),
       line("  /autoresearch optimize unit test runtime, monitor correctness"),
@@ -1235,11 +1352,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
     const workDir = resolveWorkDir(ctx.cwd);
 
-    // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
+    // Primary: read from .auto/log.jsonl (alongside .auto/prompt.md and .auto/measure.sh)
     const jsonlPath = autoresearchJsonlPath(workDir);
+    const hasPersistedLog = fs.existsSync(jsonlPath);
     let loadedFromJsonl = false;
     try {
-      if (fs.existsSync(jsonlPath)) {
+      if (hasPersistedLog) {
         const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"));
         state.name = reconstructed.name;
         state.metricName = reconstructed.metricName;
@@ -1292,8 +1410,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Read max experiments from config file
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
-    // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
+    // Auto-enter autoresearch mode only when a persisted experiment log exists.
+    // A recorded `/autoresearch on|off` in this session wins; otherwise same-cwd
+    // sessions default on and redirected workingDir sessions default off, so
+    // unrelated chats launched from a shared cwd never activate it.
+    setAutoresearchMode(
+      ctx,
+      shouldAutoActivateAutoresearch(
+        ctx.cwd,
+        workDir,
+        hasPersistedLog,
+        recordedActivationDecision(ctx, workDir),
+      ),
+    );
 
     updateWidget(ctx);
   };
@@ -1303,6 +1432,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     const runtime = getRuntime(ctx);
     const state = runtime.state;
+
+    if (!runtime.autoresearchMode) {
+      ctx.ui.setWidget("autoresearch", undefined);
+      return;
+    }
 
     if (state.results.length === 0) {
       if (!runtime.runningExperiment) {
@@ -1330,9 +1464,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (runtime.dashboardExpanded) {
-      // Expanded: full dashboard table rendered as widget
-      ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+    // Full dashboard table rendered as widget
+    ctx.ui.setWidget("autoresearch", (tui, theme) => ({
         render(width: number): string[] {
           const safeWidth = Math.max(1, width || getTuiSize(tui).width);
           const title = truncateDisplayText(
@@ -1356,108 +1489,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               safeWidth,
               theme,
               rows,
-              "ctrl+shift+t collapse • ctrl+shift+f fullscreen"
+              dashboardHintVariants()
             ),
           ];
         },
         invalidate(): void {},
       }));
-    } else {
-      // Collapsed: compact one-liner — compute everything inside render
-      ctx.ui.setWidget("autoresearch", (tui, theme) => ({
-        render(width: number): string[] {
-          const safeWidth = Math.max(1, width || getTuiSize(tui).width);
-          const cur = currentResults(state.results, state.currentSegment);
-          const kept = cur.filter((r) => r.status === "keep").length;
-          const crashed = cur.filter((r) => r.status === "crash").length;
-          const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
-          const baseline = state.bestMetric;
-          const baselineSec = findBaselineSecondary(
-            state.results,
-            state.currentSegment,
-            state.secondaryMetrics
-          );
-
-          let bestPrimary: number | null = null;
-          let bestSec: Record<string, number> = {};
-          let bestRunNum = 0;
-          for (let i = state.results.length - 1; i >= 0; i--) {
-            const r = state.results[i];
-            if (r.segment !== state.currentSegment) continue;
-            if (r.status === "keep" && r.metric > 0) {
-              if (bestPrimary === null || isBetter(r.metric, bestPrimary, state.bestDirection)) {
-                bestPrimary = r.metric;
-                bestSec = r.metrics ?? {};
-                bestRunNum = i + 1;
-              }
-            }
-          }
-
-          const displayVal = bestPrimary ?? baseline;
-          const essential = [
-            theme.fg("accent", "🔬"),
-            theme.fg("muted", ` ${state.results.length} runs`),
-            theme.fg("success", ` ${kept} kept`),
-            theme.fg("dim", " │ "),
-            theme.fg(
-              "warning",
-              theme.bold(`★ ${state.metricName}: ${formatNum(displayVal, state.metricUnit)}`)
-            ),
-            bestRunNum > 0 ? theme.fg("dim", ` #${bestRunNum}`) : "",
-          ];
-
-          const optional: string[] = [];
-          if (crashed > 0) optional.push(theme.fg("error", ` ${crashed}💥`));
-          if (checksFailed > 0) optional.push(theme.fg("error", ` ${checksFailed}⚠`));
-
-          if (baseline !== null && bestPrimary !== null && baseline !== 0 && bestPrimary !== baseline) {
-            const pct = ((bestPrimary - baseline) / baseline) * 100;
-            const sign = pct > 0 ? "+" : "";
-            const deltaColor = isBetter(bestPrimary, baseline, state.bestDirection)
-              ? "success"
-              : "error";
-            optional.push(theme.fg(deltaColor, ` (${sign}${pct.toFixed(1)}%)`));
-          }
-
-          if (state.confidence !== null) {
-            const confStr = state.confidence.toFixed(1);
-            const confColor: Parameters<typeof theme.fg>[0] = state.confidence >= 2.0 ? "success" : state.confidence >= 1.0 ? "warning" : "error";
-            optional.push(theme.fg("dim", " │ "));
-            optional.push(theme.fg(confColor, `conf: ${confStr}×`));
-          }
-
-          if (state.secondaryMetrics.length > 0) {
-            for (const sm of state.secondaryMetrics) {
-              const val = bestSec[sm.name];
-              const bv = baselineSec[sm.name];
-              if (val === undefined) continue;
-              let secText = `${sm.name}: ${formatNum(val, sm.unit)}`;
-              if (bv !== undefined && bv !== 0 && val !== bv) {
-                const p = ((val - bv) / bv) * 100;
-                const s = p > 0 ? "+" : "";
-                const c = val <= bv ? "success" : "error";
-                secText += theme.fg(c, ` ${s}${p.toFixed(1)}%`);
-              }
-              optional.push(theme.fg("dim", "  "));
-              optional.push(theme.fg("muted", secText));
-              break;
-            }
-          }
-
-          if (state.name) optional.push(theme.fg("dim", ` │ ${state.name}`));
-
-          const left = [...essential, ...optional].join("");
-          return [
-            appendRightAlignedAdaptiveHint(left, safeWidth, theme, [
-              "ctrl+shift+t expand • ctrl+shift+f fullscreen",
-              "ctrl+shift+t expand • full: ctrl+shift+f",
-              "ctrl+shift+t • ctrl+shift+f",
-            ]),
-          ];
-        },
-        invalidate(): void {},
-      }));
-    }
   };
 
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
@@ -1489,8 +1526,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
     if (!gate(runtime)) return;
-    if (hasReachedAutoResumeLimit(runtime)) {
-      notifyAutoResumeLimitReached(ctx);
+    const stopReason = autoResumeStopReasonFor(runtime);
+    if (stopReason !== null) {
+      notifyAutoResumeLimitReached(ctx, stopReason);
       return;
     }
     schedulePendingResume(ctx, runtime, composeMessage(ctx));
@@ -1531,7 +1569,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
-      "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
+      "\nWrite promising but deferred optimizations as bullet points to .auto/ideas.md — don't let good ideas get lost." +
       `\n${BENCHMARK_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
 
@@ -1558,16 +1596,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // init_experiment tool — one-time setup
   // -----------------------------------------------------------------------
 
-  pi.registerTool({
+  registerGatedTool({
     name: "init_experiment",
     label: "Init Experiment",
     description:
-      "Initialize the experiment session. Call once before the first run_experiment to set the name, primary metric, unit, and direction. Writes the config header to autoresearch.jsonl.",
+      "Initialize the experiment session. Call once before the first run_experiment to set the name, primary metric, unit, and direction. Writes the config header to .auto/log.jsonl.",
     promptSnippet:
       "Initialize experiment session (name, metric, unit, direction). Call once before first run.",
     promptGuidelines: [
       "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
-      "If autoresearch.jsonl already exists with a config, do NOT call init_experiment again.",
+      "If the session log (.auto/log.jsonl) already exists with a config, do NOT call init_experiment again.",
       "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
     ],
     parameters: InitParams,
@@ -1609,6 +1647,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const workDir = resolveWorkDir(ctx.cwd);
       try {
         const jsonlPath = autoresearchJsonlPath(workDir);
+        ensureParentDir(jsonlPath);
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -1626,14 +1665,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`,
+            text: `⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`,
           }],
           details: {},
         };
       }
 
       const wasInactive = !runtime.autoresearchMode;
-      runtime.autoresearchMode = true;
+      recordAutoresearchActivation(workDir, true);
+      setAutoresearchMode(ctx, true);
       updateWidget(ctx);
 
       if (wasInactive) {
@@ -1648,12 +1688,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
-      const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
+      const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from .auto/config.json)` : "";
       const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to .auto/log.jsonl. Now run the baseline with run_experiment.`,
         }],
         details: { state: cloneExperimentState(state) },
       };
@@ -1675,7 +1715,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // run_experiment tool
   // -----------------------------------------------------------------------
 
-  pi.registerTool({
+  registerGatedTool({
     name: "run_experiment",
     label: "Run Experiment",
     description:
@@ -1717,13 +1757,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
-      // Guard: if autoresearch.sh exists, only allow running it
+      // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
+      const benchmarkScriptRel = path.relative(workDir, autoresearchShPath) || path.basename(autoresearchShPath);
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
         return {
           content: [{
             type: "text",
-            text: `❌ autoresearch.sh exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash autoresearch.sh" }) or run_experiment({ command: "./autoresearch.sh" })`,
+            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}" }) or run_experiment({ command: "./${benchmarkScriptRel}" })`,
           }],
           details: {
             command: params.command,
@@ -2001,11 +2042,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
       } else if (checksTimedOut) {
         text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
-        text += `⏰ CHECKS TIMEOUT (autoresearch.checks.sh) after ${checksDuration.toFixed(1)}s\n`;
+        text += `⏰ CHECKS TIMEOUT (.auto/checks.sh) after ${checksDuration.toFixed(1)}s\n`;
         text += `Log this as 'checks_failed' — the benchmark metric is valid but checks timed out.\n`;
       } else if (checksPass === false) {
         text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
-        text += `💥 CHECKS FAILED (autoresearch.checks.sh) in ${checksDuration.toFixed(1)}s\n`;
+        text += `💥 CHECKS FAILED (.auto/checks.sh) in ${checksDuration.toFixed(1)}s\n`;
         text += `Log this as 'checks_failed' — the benchmark metric is valid but correctness checks did not pass.\n`;
       } else {
         text += `✅ PASSED in ${durationSeconds.toFixed(1)}s\n`;
@@ -2190,7 +2231,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // log_experiment tool
   // -----------------------------------------------------------------------
 
-  pi.registerTool({
+  registerGatedTool({
     name: "log_experiment",
     label: "Log Experiment",
     description:
@@ -2202,7 +2243,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
       "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
       "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
-      "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
+      "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to .auto/ideas.md. Don't let good ideas get lost.",
       "Always include the asi parameter. At minimum: {\"hypothesis\": \"what you tried\"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.",
     ],
     parameters: LogParams,
@@ -2227,7 +2268,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
+            text: `❌ Cannot keep — .auto/checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
           }],
           details: {},
         };
@@ -2421,17 +2462,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const jsonlLine = JSON.stringify(jsonlEntry);
 
       try {
-        fs.appendFileSync(autoresearchJsonlPath(workDir), jsonlLine + "\n");
+        const jsonlPath = autoresearchJsonlPath(workDir);
+        ensureParentDir(jsonlPath);
+        fs.appendFileSync(jsonlPath, jsonlLine + "\n");
         broadcastDashboardUpdate(workDir);
       } catch (e) {
-        text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+        text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
       if (params.status !== "keep") {
         try {
           const revertScript = `
-            git checkout -- . ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
-            git clean -fd -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+            git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
           `;
           await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
@@ -2456,7 +2499,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
-        runtime.autoresearchMode = false;
+        recordAutoresearchActivation(workDir, false);
+        setAutoresearchMode(ctx, false);
         ctx.abort();
       } else if (runtime.autoresearchMode) {
         const beforeSteer = await fireHook({
@@ -2561,43 +2605,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Ctrl+Shift+T — toggle dashboard expand/collapse
+  // Fullscreen scrollable dashboard overlay shortcut
   // -----------------------------------------------------------------------
 
-  pi.registerShortcut("ctrl+shift+t", {
-    description: "Toggle autoresearch dashboard",
-    handler: async (ctx) => {
-      const runtime = getRuntime(ctx);
-      const state = runtime.state;
-      if (state.results.length === 0) {
-        if (!runtime.autoresearchMode && !fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)))) {
-          ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
-        } else {
-          ctx.ui.notify("No experiments yet", "info");
+  if (shortcuts.fullscreenDashboard) {
+    pi.registerShortcut(shortcuts.fullscreenDashboard, {
+      description: "Fullscreen autoresearch dashboard",
+      handler: async (ctx) => {
+        const runtime = getRuntime(ctx);
+        const state = runtime.state;
+        if (!runtime.autoresearchMode) {
+          ctx.ui.notify("Autoresearch mode is not active", "info");
+          return;
         }
-        return;
-      }
-      runtime.dashboardExpanded = !runtime.dashboardExpanded;
-      updateWidget(ctx);
-    },
-  });
+        if (state.results.length === 0) {
+          ctx.ui.notify("No experiments yet", "info");
+          return;
+        }
 
-  // -----------------------------------------------------------------------
-  // Ctrl+Shift+F — fullscreen scrollable dashboard overlay
-  // -----------------------------------------------------------------------
-
-  pi.registerShortcut("ctrl+shift+f", {
-    description: "Fullscreen autoresearch dashboard",
-    handler: async (ctx) => {
-      const runtime = getRuntime(ctx);
-      const state = runtime.state;
-      if (state.results.length === 0) {
-        ctx.ui.notify("No experiments yet", "info");
-        return;
-      }
-
-      await ctx.ui.custom<void>(
-        (tui, theme, _kb, done) => {
+        await ctx.ui.custom<void>(
+          (tui, theme, _kb, done) => {
           let scrollOffset = 0;
           let lastViewportRows = 8;
           let lastTotalRows = 0;
@@ -2712,18 +2739,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               clearOverlay();
             },
           };
-        },
-        {
-          overlay: true,
-          overlayOptions: {
-            width: "95%",
-            maxHeight: "90%",
-            anchor: "center" as const,
           },
-        }
-      );
-    },
-  });
+          {
+            overlay: true,
+            overlayOptions: {
+              width: "95%",
+              maxHeight: "90%",
+              anchor: "center" as const,
+            },
+          }
+        );
+      },
+    });
+  }
 
   // -----------------------------------------------------------------------
   // Export: local live dashboard
@@ -2784,17 +2812,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const dashboardSseClients = new Set<ServerResponse>();
 
   function openInBrowser(url: string): void {
-    if (process.platform === "win32") {
-      spawn("cmd", ["/c", "start", "", url], {
-        detached: true,
-        shell: true,
-        stdio: "ignore",
-      }).unref();
-      return;
-    }
-
-    const openCmd = process.platform === "darwin" ? "open" : "xdg-open";
-    spawn(openCmd, [url], { detached: true, stdio: "ignore" }).unref();
+    const child = process.platform === "win32"
+      ? spawn("cmd", ["/c", "start", "", url], {
+          detached: true,
+          shell: true,
+          stdio: "ignore",
+        })
+      : spawn(process.platform === "darwin" ? "open" : "xdg-open", [url], {
+          detached: true,
+          stdio: "ignore",
+        });
+    // Swallow launcher errors (e.g. xdg-open missing); caller prints the URL
+    // so the user can open it manually.
+    child.on("error", () => { /* ignore */ });
+    child.unref();
   }
 
   function stopDashboardServer(): void {
@@ -2929,7 +2960,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const jsonlPath = autoresearchJsonlPath(workDir);
 
     if (!fs.existsSync(jsonlPath)) {
-      ctx.ui.notify("No autoresearch.jsonl found \u2014 run some experiments first", "error");
+      ctx.ui.notify(`No ${path.basename(jsonlPath)} found \u2014 run some experiments first`, "error");
       return;
     }
 
@@ -2966,9 +2997,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "off") {
         const wasRunning = !ctx.isIdle();
+        const workDir = resolveWorkDir(ctx.cwd);
 
-        runtime.autoresearchMode = false;
-        runtime.dashboardExpanded = false;
+        recordAutoresearchActivation(workDir, false);
+        setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
@@ -2991,30 +3023,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
-        runtime.autoresearchMode = false;
-        runtime.dashboardExpanded = false;
+        const workDir = resolveWorkDir(ctx.cwd);
+        const jsonlPaths = sessionFileCandidates(workDir, "log");
+        recordAutoresearchActivation(workDir, false);
+        setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
         cancelPendingResume(runtime);
         runtime.state = createExperimentState();
         stopDashboardServer();
         updateWidget(ctx);
 
-        if (fs.existsSync(jsonlPath)) {
+        const deletedPaths: string[] = [];
+        for (const jsonlPath of Object.values(jsonlPaths)) {
+          if (!fs.existsSync(jsonlPath)) continue;
           try {
             fs.unlinkSync(jsonlPath);
-            ctx.ui.notify("Deleted autoresearch.jsonl and turned autoresearch mode OFF", "info");
+            deletedPaths.push(path.relative(workDir, jsonlPath) || path.basename(jsonlPath));
           } catch (error) {
             ctx.ui.notify(
-              `Failed to delete autoresearch.jsonl: ${error instanceof Error ? error.message : String(error)}`,
+              `Failed to delete ${path.relative(workDir, jsonlPath) || path.basename(jsonlPath)}: ${error instanceof Error ? error.message : String(error)}`,
               "error"
             );
+            return;
           }
+        }
+
+        if (deletedPaths.length > 0) {
+          ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} and turned autoresearch mode OFF`, "info");
         } else {
-          ctx.ui.notify("No autoresearch.jsonl found. Autoresearch mode OFF", "info");
+          ctx.ui.notify("No session log found. Autoresearch mode OFF", "info");
         }
         return;
       }
@@ -3024,19 +3065,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
-      runtime.autoresearchMode = true;
-      runtime.autoResumeTurns = 0;
-
       const workDir = resolveWorkDir(ctx.cwd);
+      recordAutoresearchActivation(workDir, true);
+      setAutoresearchMode(ctx, true);
+      runtime.autoResumeTurns = 0;
       const rulesLoaded = hasAutoresearchRules(ctx);
+      // No .auto/prompt.md yet — load the create skill so the agent follows the
+      // setup guidelines. `/skill:<name>` is expanded to the full SKILL.md by
+      // pi's input pipeline (requires `enableSkillCommands`), and trailing args
+      // are appended as the session goal. Must be sent as its own message that
+      // STARTS with `/skill:` so expansion triggers — don't prepend hook output.
       const kickoff = rulesLoaded
         ? `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
-        : `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`;
+        : `/skill:autoresearch-create ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
 
       ctx.ui.notify(
         rulesLoaded
-          ? "Autoresearch mode ON — rules loaded from autoresearch.md"
-          : "Autoresearch mode ON — no autoresearch.md found, setting up",
+          ? "Autoresearch mode ON — rules loaded from .auto/prompt.md"
+          : "Autoresearch mode ON — no .auto/prompt.md found, loading autoresearch-create skill",
         "info",
       );
 
@@ -3049,7 +3095,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         session: buildSessionSnapshot(state),
       });
 
-      sendWhenReady(ctx, activationSteer ? `${activationSteer}\n\n${kickoff}` : kickoff);
+      // Prepend hook output only when prompt.md exists; otherwise the message
+      // must stay `/skill:...`-prefixed for command expansion.
+      const message = activationSteer && rulesLoaded ? `${activationSteer}\n\n${kickoff}` : kickoff;
+      sendWhenReady(ctx, message);
     },
   });
 }
