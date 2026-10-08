@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Use the current TypeBox package and Pi 1.1.0 development/test baseline.
+
 ## [1.6.2] - 2026-07-09
 
 ### Changed
